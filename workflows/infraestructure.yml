@@ -1,0 +1,1006 @@
+name: Provision Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      cloud_provider:
+        description: 'Cloud provider'
+        required: true
+        default: 'azure'
+        type: choice
+        options:
+        - azure
+        - aws
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'create'
+        type: choice
+        options:
+        - create
+        - destroy
+
+env:
+  # Azure
+  RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP }}
+  AKS_NAME: ${{ vars.AKS_NAME }}
+  CONTAINER_NAME: ${{ vars.CONTAINER_NAME }}
+  AZURE_LOCATION: ${{ vars.AZURE_LOCATION }}
+  # AWS
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
+  ECR_REPOSITORY_NAME: ${{ vars.ECR_REPOSITORY_NAME }}
+
+jobs:
+  # ==============================
+  # AZURE - Create Infrastructure
+  # ==============================
+  azure-create:
+    name: Azure - Create Infrastructure
+    if: ${{ inputs.cloud_provider == 'azure' && inputs.action == 'create' }}
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Azure Login
+      uses: Azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Create Azure Infrastructure
+      run: |
+        echo "=== CREATING AZURE INFRASTRUCTURE ==="
+        echo ""
+
+        ACR_NAME="acredteamdevsecops"
+        echo "ACR_NAME=$ACR_NAME" >> $GITHUB_ENV
+
+        echo "Resources to create:"
+        echo "- Resource Group: ${{ env.RESOURCE_GROUP }} (using existing)"
+        echo "- AKS Cluster: ${{ env.AKS_NAME }}"
+        echo "- ACR Registry: $ACR_NAME"
+        echo "- Location: ${{ env.AZURE_LOCATION }}"
+        echo ""
+
+        # 1. Verify Resource Group exists
+        echo "📦 Verifying Resource Group exists..."
+        if az group show --name ${{ env.RESOURCE_GROUP }} > /dev/null 2>&1; then
+          echo "✅ Resource Group exists: ${{ env.RESOURCE_GROUP }}"
+          RG_LOCATION=$(az group show --name ${{ env.RESOURCE_GROUP }} --query location -o tsv)
+          echo "📍 Resource Group location: $RG_LOCATION"
+        else
+          echo "❌ Resource Group not found: ${{ env.RESOURCE_GROUP }}"
+          echo ""
+          echo "🔍 Available Resource Groups:"
+          az group list --query "[].{Name:name, Location:location}" -o table
+          echo ""
+          echo "💡 Please update the RESOURCE_GROUP variable with an existing RG name"
+          exit 1
+        fi
+
+        # 2. Create Azure Container Registry
+        echo "🐳 Creating Azure Container Registry..."
+        if az acr show --name $ACR_NAME > /dev/null 2>&1; then
+          echo "⚠️ ACR already exists: $ACR_NAME"
+        else
+          az acr create \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --name $ACR_NAME \
+            --sku Basic \
+            --admin-enabled true
+          echo "✅ ACR created: $ACR_NAME"
+        fi
+
+        # 3. Create AKS Cluster
+        echo "☸️ Creating AKS Cluster..."
+        if az aks show --resource-group ${{ env.RESOURCE_GROUP }} --name ${{ env.AKS_NAME }} > /dev/null 2>&1; then
+          echo "⚠️ AKS cluster already exists: ${{ env.AKS_NAME }}"
+        else
+          az aks create \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --name ${{ env.AKS_NAME }} \
+            --node-count 1 \
+            --node-vm-size Standard_D2s_v3 \
+            --generate-ssh-keys \
+            --enable-managed-identity
+          echo "✅ AKS Cluster created"
+        fi
+
+        # 4. Get AKS credentials
+        echo "🔑 Getting AKS credentials..."
+        az aks get-credentials \
+          --resource-group ${{ env.RESOURCE_GROUP }} \
+          --name ${{ env.AKS_NAME }} \
+          --overwrite-existing
+
+        # 5. Configure ACR access via K8s secret
+        echo "🔗 Configuring ACR access..."
+        ACR_SERVER=$(az acr show --name $ACR_NAME --resource-group ${{ env.RESOURCE_GROUP }} --query loginServer -o tsv)
+        ACR_USERNAME=$(az acr credential show --name $ACR_NAME --resource-group ${{ env.RESOURCE_GROUP }} --query username -o tsv)
+        ACR_PASSWORD=$(az acr credential show --name $ACR_NAME --resource-group ${{ env.RESOURCE_GROUP }} --query passwords[0].value -o tsv)
+
+        kubectl create secret docker-registry registry-secret \
+          --namespace=default \
+          --docker-server=$ACR_SERVER \
+          --docker-username=$ACR_USERNAME \
+          --docker-password=$ACR_PASSWORD \
+          --docker-email=noreply@example.com \
+          --dry-run=client -o yaml | kubectl apply -f -
+
+        echo "✅ ACR access configured via Kubernetes secret"
+
+        # 6. Install Traefik Ingress Controller via Helm
+        echo "🌐 Installing Traefik Ingress Controller..."
+        if kubectl get namespace traefik > /dev/null 2>&1; then
+          echo "✅ Traefik Ingress Controller already installed"
+        else
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          helm repo add traefik https://traefik.github.io/charts
+          helm repo update
+          helm install traefik traefik/traefik \
+            --namespace traefik \
+            --create-namespace \
+            --set service.type=LoadBalancer
+
+          echo "⏳ Waiting for Traefik Ingress Controller..."
+          kubectl wait --namespace traefik \
+            --for=condition=ready pod \
+            --selector=app.kubernetes.io/name=traefik \
+            --timeout=300s
+        fi
+
+        echo ""
+        echo "=== AZURE INFRASTRUCTURE CREATED SUCCESSFULLY ==="
+
+    - name: Verify Azure Infrastructure
+      run: |
+        echo "🔍 === VERIFYING AZURE INFRASTRUCTURE ==="
+        echo ""
+        echo "🐳 Azure Container Registry:"
+        az acr list --resource-group ${{ env.RESOURCE_GROUP }} --query "[].{Name:name, LoginServer:loginServer}" -o table
+        echo ""
+        echo "☸️ AKS Cluster:"
+        az aks show --resource-group ${{ env.RESOURCE_GROUP }} --name ${{ env.AKS_NAME }} --query "{Name:name, Status:provisioningState, KubernetesVersion:kubernetesVersion}" -o table
+        echo ""
+        echo "🔗 Kubernetes nodes:"
+        kubectl get nodes
+        echo ""
+        echo "🌐 Traefik Ingress Controller:"
+        kubectl get pods -n traefik -l app.kubernetes.io/name=traefik
+        echo ""
+        echo "🔗 Ingress Controller Service:"
+        kubectl get service -n traefik traefik
+        echo ""
+        echo "✅ All Azure components verified!"
+
+    - name: Generate Azure Summary
+      run: |
+        ACR_LOGIN_SERVER=$(az acr list --resource-group ${{ env.RESOURCE_GROUP }} --query "[0].loginServer" -o tsv)
+        ACR_NAME_ONLY=$(az acr list --resource-group ${{ env.RESOURCE_GROUP }} --query "[0].name" -o tsv)
+
+        # Get Traefik LoadBalancer IP
+        TRAEFIK_IP=""
+        for i in $(seq 1 30); do
+          TRAEFIK_IP=$(kubectl get service -n traefik traefik -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)
+          if [ -n "$TRAEFIK_IP" ]; then break; fi
+          echo "Waiting for Traefik LoadBalancer IP... ($i/30)"
+          sleep 10
+        done
+        if [ -z "$TRAEFIK_IP" ]; then
+          TRAEFIK_IP="(pending - may take a few more minutes)"
+        fi
+
+        # Verify public reachability from GitHub runner
+        INTERNET_STATUS="NOT_CHECKED"
+        INTERNET_DETAILS="LoadBalancer IP pending"
+        if [[ "$TRAEFIK_IP" != \(* ]]; then
+          for i in $(seq 1 20); do
+            HTTP_CODE=$(curl -sS -o /dev/null -w "%{http_code}" "http://$TRAEFIK_IP/" || echo "000")
+            if [ "$HTTP_CODE" != "000" ]; then
+              INTERNET_STATUS="PASS"
+              INTERNET_DETAILS="HTTP $HTTP_CODE from http://$TRAEFIK_IP/"
+              break
+            fi
+            sleep 5
+          done
+        fi
+        if [ "$INTERNET_STATUS" != "PASS" ] && [[ "$TRAEFIK_IP" != \(* ]]; then
+          INTERNET_STATUS="FAIL"
+          INTERNET_DETAILS="No HTTP response from http://$TRAEFIK_IP/"
+        fi
+
+        # Get cluster info
+        K8S_VERSION=$(az aks show --resource-group ${{ env.RESOURCE_GROUP }} --name ${{ env.AKS_NAME }} --query kubernetesVersion -o tsv)
+        NODE_INFO=$(kubectl get nodes -o wide --no-headers 2>/dev/null || echo "No nodes found")
+        TRAEFIK_SVC=$(kubectl get service -n traefik traefik --no-headers 2>/dev/null || echo "Not found")
+
+        echo "## 🎉 Azure Infrastructure Created" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 📋 Resources:" >> $GITHUB_STEP_SUMMARY
+        echo "| Resource | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Cloud Provider | Azure |" >> $GITHUB_STEP_SUMMARY
+        echo "| Resource Group | \`${{ env.RESOURCE_GROUP }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| AKS Cluster | \`${{ env.AKS_NAME }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| Kubernetes Version | \`$K8S_VERSION\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| ACR Registry | \`$ACR_LOGIN_SERVER\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| Location | ${{ env.AZURE_LOCATION }} |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🌐 Traefik Ingress (LoadBalancer):" >> $GITHUB_STEP_SUMMARY
+        echo "- **External IP**: \`$TRAEFIK_IP\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Internet Reachability**: **$INTERNET_STATUS**" >> $GITHUB_STEP_SUMMARY
+        echo "- **Check Detail**: $INTERNET_DETAILS" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        echo "$TRAEFIK_SVC" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🖥️ Nodes:" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        echo "$NODE_INFO" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🧪 Test your cluster:" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+        echo "# App Python" >> $GITHUB_STEP_SUMMARY
+        echo "curl http://$TRAEFIK_IP/" >> $GITHUB_STEP_SUMMARY
+        echo "# App Go" >> $GITHUB_STEP_SUMMARY
+        echo "curl http://$TRAEFIK_IP/go/" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🔧 Next Steps:" >> $GITHUB_STEP_SUMMARY
+        echo "1. Set variable \`CLOUD_PROVIDER\` = \`azure\`" >> $GITHUB_STEP_SUMMARY
+        echo "2. Set variable \`REGISTRY_NAME\` = \`$ACR_NAME_ONLY\`" >> $GITHUB_STEP_SUMMARY
+        echo "3. Push code to main to trigger deployment" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 💡 Local access (optional):" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+        echo "az aks get-credentials --resource-group ${{ env.RESOURCE_GROUP }} --name ${{ env.AKS_NAME }}" >> $GITHUB_STEP_SUMMARY
+        echo "kubectl get pods" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+  # ===============================
+  # AZURE - Destroy Infrastructure
+  # ===============================
+  azure-destroy:
+    name: Azure - Destroy Infrastructure
+    if: ${{ inputs.cloud_provider == 'azure' && inputs.action == 'destroy' }}
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Azure Login
+      uses: Azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Destroy Azure Infrastructure
+      run: |
+        echo "=== DESTROYING AZURE INFRASTRUCTURE ==="
+        echo ""
+        echo "⚠️ This will delete AKS and ACR from: ${{ env.RESOURCE_GROUP }}"
+        echo "📦 Resource Group will NOT be deleted"
+        echo ""
+
+        if az group show --name ${{ env.RESOURCE_GROUP }} > /dev/null 2>&1; then
+          # Delete AKS
+          if az aks show --resource-group ${{ env.RESOURCE_GROUP }} --name ${{ env.AKS_NAME }} > /dev/null 2>&1; then
+            echo "🗑️ Deleting AKS Cluster: ${{ env.AKS_NAME }}..."
+            az aks delete --resource-group ${{ env.RESOURCE_GROUP }} --name ${{ env.AKS_NAME }} --yes --no-wait
+            echo "✅ AKS deletion initiated"
+          else
+            echo "- AKS Cluster: Not found"
+          fi
+
+          # Delete ACR
+          ACR_LIST=$(az acr list --resource-group ${{ env.RESOURCE_GROUP }} --query "[].name" -o tsv)
+          if [ ! -z "$ACR_LIST" ]; then
+            for ACR_NAME in $ACR_LIST; do
+              if [[ $ACR_NAME == acredteamdevsecops* ]]; then
+                echo "🗑️ Deleting ACR: $ACR_NAME..."
+                az acr delete --resource-group ${{ env.RESOURCE_GROUP }} --name $ACR_NAME --yes
+                echo "✅ ACR deleted: $ACR_NAME"
+              fi
+            done
+          else
+            echo "- ACR Registry: Not found"
+          fi
+
+          echo ""
+          echo "✅ Azure cleanup completed"
+          echo "📦 Resource Group '${{ env.RESOURCE_GROUP }}' preserved"
+        else
+          echo "❌ Resource Group doesn't exist: ${{ env.RESOURCE_GROUP }}"
+        fi
+
+    - name: Generate Azure Cleanup Summary
+      run: |
+        echo "## 🗑️ Azure Infrastructure Cleanup" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "- **Cloud Provider**: Azure" >> $GITHUB_STEP_SUMMARY
+        echo "- **AKS Cluster**: 🗑️ Deleted" >> $GITHUB_STEP_SUMMARY
+        echo "- **ACR Registry**: 🗑️ Deleted" >> $GITHUB_STEP_SUMMARY
+        echo "- **Resource Group**: ✅ Preserved" >> $GITHUB_STEP_SUMMARY
+
+  # ===========================
+  # AWS - Create Infrastructure
+  # ===========================
+  aws-create:
+    name: AWS - Create Infrastructure
+    if: ${{ inputs.cloud_provider == 'aws' && inputs.action == 'create' }}
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Create AWS Infrastructure
+      timeout-minutes: 30
+      run: |
+        echo "=== CREATING AWS INFRASTRUCTURE (Pure CLI - No eksctl/CloudFormation) ==="
+        echo ""
+        echo "Resources to create:"
+        echo "- ECR Repository: ${{ env.ECR_REPOSITORY_NAME }}"
+        echo "- EKS Cluster: ${{ env.EKS_CLUSTER_NAME }}"
+        echo "- Region: ${{ env.AWS_REGION }}"
+        echo ""
+
+        AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+        echo "AWS Account: $AWS_ACCOUNT_ID"
+
+        # 1. Create ECR Repository
+        echo "🐳 Creating ECR Repository..."
+        if aws ecr describe-repositories --repository-names ${{ env.ECR_REPOSITORY_NAME }} --region ${{ env.AWS_REGION }} > /dev/null 2>&1; then
+          echo "⚠️ ECR repository already exists: ${{ env.ECR_REPOSITORY_NAME }}"
+        else
+          aws ecr create-repository \
+            --repository-name ${{ env.ECR_REPOSITORY_NAME }} \
+            --image-scanning-configuration scanOnPush=true \
+            --region ${{ env.AWS_REGION }}
+          echo "✅ ECR repository created: ${{ env.ECR_REPOSITORY_NAME }}"
+        fi
+
+        # 2. Create IAM roles
+        echo "🔑 Setting up IAM roles..."
+
+        # EKS Cluster Role
+        if aws iam get-role --role-name eksClusterRole > /dev/null 2>&1; then
+          echo "✅ eksClusterRole already exists"
+        else
+          echo "📝 Creating eksClusterRole..."
+          aws iam create-role \
+            --role-name eksClusterRole \
+            --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"eks.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+          aws iam attach-role-policy \
+            --role-name eksClusterRole \
+            --policy-arn arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+          echo "✅ eksClusterRole created"
+          echo "⏳ Waiting for IAM role propagation..."
+          sleep 15
+        fi
+
+        # EKS Node Role
+        if aws iam get-role --role-name AmazonEKSNodeRole > /dev/null 2>&1; then
+          echo "✅ AmazonEKSNodeRole already exists"
+        else
+          echo "📝 Creating AmazonEKSNodeRole..."
+          aws iam create-role \
+            --role-name AmazonEKSNodeRole \
+            --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+          aws iam attach-role-policy --role-name AmazonEKSNodeRole \
+            --policy-arn arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+          aws iam attach-role-policy --role-name AmazonEKSNodeRole \
+            --policy-arn arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+          aws iam attach-role-policy --role-name AmazonEKSNodeRole \
+            --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+          aws iam attach-role-policy --role-name AmazonEKSNodeRole \
+            --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+          echo "✅ AmazonEKSNodeRole created"
+        fi
+
+        # Create instance profile for nodes
+        if aws iam get-instance-profile --instance-profile-name AmazonEKSNodeInstanceProfile > /dev/null 2>&1; then
+          echo "✅ Instance profile already exists"
+        else
+          echo "📝 Creating instance profile..."
+          aws iam create-instance-profile --instance-profile-name AmazonEKSNodeInstanceProfile
+          aws iam add-role-to-instance-profile \
+            --instance-profile-name AmazonEKSNodeInstanceProfile \
+            --role-name AmazonEKSNodeRole
+          echo "✅ Instance profile created"
+          echo "⏳ Waiting for instance profile propagation..."
+          sleep 15
+        fi
+
+        EKS_CLUSTER_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/eksClusterRole"
+        EKS_NODE_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/AmazonEKSNodeRole"
+
+        # 3. Create VPC and networking
+        echo "🌐 Creating VPC and networking..."
+        VPC_ID=$(aws ec2 describe-vpcs \
+          --filters "Name=tag:Name,Values=eks-${{ env.EKS_CLUSTER_NAME }}-vpc" \
+          --query "Vpcs[0].VpcId" --output text 2>/dev/null)
+
+        if [ "$VPC_ID" != "None" ] && [ -n "$VPC_ID" ]; then
+          echo "⚠️ VPC already exists: $VPC_ID"
+        else
+          VPC_ID=$(aws ec2 create-vpc --cidr-block 10.0.0.0/16 \
+            --query 'Vpc.VpcId' --output text)
+          aws ec2 create-tags --resources $VPC_ID \
+            --tags Key=Name,Value=eks-${{ env.EKS_CLUSTER_NAME }}-vpc
+          aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-support
+          aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-hostnames
+          echo "✅ VPC created: $VPC_ID"
+        fi
+
+        # Get AZs
+        AZ1=$(aws ec2 describe-availability-zones --region ${{ env.AWS_REGION }} \
+          --query "AvailabilityZones[0].ZoneName" --output text)
+        AZ2=$(aws ec2 describe-availability-zones --region ${{ env.AWS_REGION }} \
+          --query "AvailabilityZones[1].ZoneName" --output text)
+        echo "Using AZs: $AZ1, $AZ2"
+
+        # Public subnets
+        SUBNET_PUB1=$(aws ec2 describe-subnets \
+          --filters "Name=tag:Name,Values=eks-${{ env.EKS_CLUSTER_NAME }}-public-1" \
+          --query "Subnets[0].SubnetId" --output text 2>/dev/null)
+        if [ "$SUBNET_PUB1" == "None" ] || [ -z "$SUBNET_PUB1" ]; then
+          SUBNET_PUB1=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.0.1.0/24 \
+            --availability-zone $AZ1 --query 'Subnet.SubnetId' --output text)
+          aws ec2 create-tags --resources $SUBNET_PUB1 \
+            --tags Key=Name,Value=eks-${{ env.EKS_CLUSTER_NAME }}-public-1 \
+                   Key=kubernetes.io/role/elb,Value=1 \
+                   Key=kubernetes.io/cluster/${{ env.EKS_CLUSTER_NAME }},Value=shared
+          aws ec2 modify-subnet-attribute --subnet-id $SUBNET_PUB1 --map-public-ip-on-launch
+        fi
+
+        SUBNET_PUB2=$(aws ec2 describe-subnets \
+          --filters "Name=tag:Name,Values=eks-${{ env.EKS_CLUSTER_NAME }}-public-2" \
+          --query "Subnets[0].SubnetId" --output text 2>/dev/null)
+        if [ "$SUBNET_PUB2" == "None" ] || [ -z "$SUBNET_PUB2" ]; then
+          SUBNET_PUB2=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.0.2.0/24 \
+            --availability-zone $AZ2 --query 'Subnet.SubnetId' --output text)
+          aws ec2 create-tags --resources $SUBNET_PUB2 \
+            --tags Key=Name,Value=eks-${{ env.EKS_CLUSTER_NAME }}-public-2 \
+                   Key=kubernetes.io/role/elb,Value=1 \
+                   Key=kubernetes.io/cluster/${{ env.EKS_CLUSTER_NAME }},Value=shared
+          aws ec2 modify-subnet-attribute --subnet-id $SUBNET_PUB2 --map-public-ip-on-launch
+        fi
+        echo "✅ Subnets: $SUBNET_PUB1, $SUBNET_PUB2"
+
+        # Internet Gateway
+        IGW_ID=$(aws ec2 describe-internet-gateways \
+          --filters "Name=tag:Name,Values=eks-${{ env.EKS_CLUSTER_NAME }}-igw" \
+          --query "InternetGateways[0].InternetGatewayId" --output text 2>/dev/null)
+        if [ "$IGW_ID" == "None" ] || [ -z "$IGW_ID" ]; then
+          IGW_ID=$(aws ec2 create-internet-gateway --query 'InternetGateway.InternetGatewayId' --output text)
+          aws ec2 create-tags --resources $IGW_ID \
+            --tags Key=Name,Value=eks-${{ env.EKS_CLUSTER_NAME }}-igw
+          aws ec2 attach-internet-gateway --internet-gateway-id $IGW_ID --vpc-id $VPC_ID
+        fi
+        echo "✅ Internet Gateway: $IGW_ID"
+
+        # Route table
+        RTB_ID=$(aws ec2 describe-route-tables \
+          --filters "Name=tag:Name,Values=eks-${{ env.EKS_CLUSTER_NAME }}-public-rt" \
+          --query "RouteTables[0].RouteTableId" --output text 2>/dev/null)
+        if [ "$RTB_ID" == "None" ] || [ -z "$RTB_ID" ]; then
+          RTB_ID=$(aws ec2 create-route-table --vpc-id $VPC_ID \
+            --query 'RouteTable.RouteTableId' --output text)
+          aws ec2 create-tags --resources $RTB_ID \
+            --tags Key=Name,Value=eks-${{ env.EKS_CLUSTER_NAME }}-public-rt
+          aws ec2 create-route --route-table-id $RTB_ID \
+            --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW_ID
+          aws ec2 associate-route-table --route-table-id $RTB_ID --subnet-id $SUBNET_PUB1
+          aws ec2 associate-route-table --route-table-id $RTB_ID --subnet-id $SUBNET_PUB2
+        fi
+        echo "✅ Route table: $RTB_ID"
+
+        # Security group for cluster
+        CLUSTER_SG=$(aws ec2 describe-security-groups \
+          --filters "Name=tag:Name,Values=eks-${{ env.EKS_CLUSTER_NAME }}-cluster-sg" "Name=vpc-id,Values=$VPC_ID" \
+          --query "SecurityGroups[0].GroupId" --output text 2>/dev/null)
+        if [ "$CLUSTER_SG" == "None" ] || [ -z "$CLUSTER_SG" ]; then
+          CLUSTER_SG=$(aws ec2 create-security-group \
+            --group-name eks-${{ env.EKS_CLUSTER_NAME }}-cluster-sg \
+            --description "EKS Cluster SG" \
+            --vpc-id $VPC_ID --query 'GroupId' --output text)
+          aws ec2 create-tags --resources $CLUSTER_SG \
+            --tags Key=Name,Value=eks-${{ env.EKS_CLUSTER_NAME }}-cluster-sg
+        fi
+        echo "✅ Cluster SG: $CLUSTER_SG"
+
+        # Security group for nodes
+        NODE_SG=$(aws ec2 describe-security-groups \
+          --filters "Name=tag:Name,Values=eks-${{ env.EKS_CLUSTER_NAME }}-node-sg" "Name=vpc-id,Values=$VPC_ID" \
+          --query "SecurityGroups[0].GroupId" --output text 2>/dev/null)
+        if [ "$NODE_SG" == "None" ] || [ -z "$NODE_SG" ]; then
+          NODE_SG=$(aws ec2 create-security-group \
+            --group-name eks-${{ env.EKS_CLUSTER_NAME }}-node-sg \
+            --description "EKS Node SG" \
+            --vpc-id $VPC_ID --query 'GroupId' --output text)
+          aws ec2 create-tags --resources $NODE_SG \
+            --tags Key=Name,Value=eks-${{ env.EKS_CLUSTER_NAME }}-node-sg
+
+          # Node <-> Node communication
+          aws ec2 authorize-security-group-ingress --group-id $NODE_SG \
+            --protocol all --source-group $NODE_SG
+          # Cluster -> Node
+          aws ec2 authorize-security-group-ingress --group-id $NODE_SG \
+            --protocol tcp --port 1025-65535 --source-group $CLUSTER_SG
+          aws ec2 authorize-security-group-ingress --group-id $NODE_SG \
+            --protocol tcp --port 443 --source-group $CLUSTER_SG
+          # Node -> Cluster
+          aws ec2 authorize-security-group-ingress --group-id $CLUSTER_SG \
+            --protocol tcp --port 443 --source-group $NODE_SG
+          # HTTP/HTTPS public access (for LoadBalancer)
+          aws ec2 authorize-security-group-ingress --group-id $NODE_SG \
+            --protocol tcp --port 80 --cidr 0.0.0.0/0
+          aws ec2 authorize-security-group-ingress --group-id $NODE_SG \
+            --protocol tcp --port 443 --cidr 0.0.0.0/0
+          # NodePort range for NLB -> Node traffic (NLB forwards to NodePorts, not port 80/443 directly)
+          aws ec2 authorize-security-group-ingress --group-id $NODE_SG \
+            --protocol tcp --port 30000-32767 --cidr 0.0.0.0/0
+          # Node -> Internet (for pulling images)
+          aws ec2 authorize-security-group-egress --group-id $NODE_SG \
+            --protocol all --cidr 0.0.0.0/0 2>/dev/null || true
+        fi
+        echo "✅ Node SG: $NODE_SG"
+
+        # 4. Create EKS Cluster
+        echo "☸️ Creating EKS Cluster (this may take 10-15 minutes)..."
+        CLUSTER_STATUS=$(aws eks describe-cluster --name ${{ env.EKS_CLUSTER_NAME }} \
+          --query "cluster.status" --output text 2>/dev/null || echo "NOT_FOUND")
+
+        if [ "$CLUSTER_STATUS" == "ACTIVE" ]; then
+          echo "⚠️ EKS cluster already exists and is ACTIVE"
+        elif [ "$CLUSTER_STATUS" == "CREATING" ]; then
+          echo "⏳ Cluster is still creating, waiting..."
+          aws eks wait cluster-active --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+          echo "✅ Cluster is now ACTIVE"
+        else
+          echo "Creating cluster with role: $EKS_CLUSTER_ROLE_ARN"
+          aws eks create-cluster \
+            --name ${{ env.EKS_CLUSTER_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --role-arn "$EKS_CLUSTER_ROLE_ARN" \
+            --resources-vpc-config "subnetIds=$SUBNET_PUB1,$SUBNET_PUB2,securityGroupIds=$CLUSTER_SG,endpointPublicAccess=true,endpointPrivateAccess=false"
+
+          echo "⏳ Waiting for cluster to become ACTIVE..."
+          aws eks wait cluster-active --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+          echo "✅ EKS Cluster is ACTIVE"
+        fi
+
+        # 5. Update kubeconfig
+        echo "🔑 Updating kubeconfig..."
+        aws eks update-kubeconfig \
+          --name ${{ env.EKS_CLUSTER_NAME }} \
+          --region ${{ env.AWS_REGION }}
+
+        # 6. Launch worker node (self-managed via EC2)
+        echo "🖥️ Launching worker node..."
+        EXISTING_NODE=$(aws ec2 describe-instances \
+          --filters "Name=tag:Name,Values=eks-${{ env.EKS_CLUSTER_NAME }}-node" \
+                    "Name=instance-state-name,Values=running,pending" \
+          --query "Reservations[0].Instances[0].InstanceId" --output text 2>/dev/null)
+
+        if [ "$EXISTING_NODE" != "None" ] && [ -n "$EXISTING_NODE" ]; then
+          echo "⚠️ Worker node already exists: $EXISTING_NODE"
+        else
+          # Get EKS optimized AMI
+          EKS_VERSION=$(aws eks describe-cluster --name ${{ env.EKS_CLUSTER_NAME }} \
+            --query "cluster.version" --output text)
+          EKS_AMI=$(aws ssm get-parameter \
+            --name "/aws/service/eks/optimized-ami/${EKS_VERSION}/amazon-linux-2023/x86_64/standard/recommended/image_id" \
+            --query "Parameter.Value" --output text)
+          echo "Using AMI: $EKS_AMI (EKS ${EKS_VERSION})"
+
+          # Get cluster details for bootstrap
+          CLUSTER_ENDPOINT=$(aws eks describe-cluster --name ${{ env.EKS_CLUSTER_NAME }} \
+            --query "cluster.endpoint" --output text)
+          CLUSTER_CA=$(aws eks describe-cluster --name ${{ env.EKS_CLUSTER_NAME }} \
+            --query "cluster.certificateAuthority.data" --output text)
+          CLUSTER_CIDR=$(aws eks describe-cluster --name ${{ env.EKS_CLUSTER_NAME }} \
+            --query "cluster.kubernetesNetworkConfig.serviceIpv4Cidr" --output text)
+
+          # Create userdata for node bootstrap
+          cat > /tmp/userdata.txt <<USERDATA
+        MIME-Version: 1.0
+        Content-Type: multipart/mixed; boundary="BOUNDARY"
+
+        --BOUNDARY
+        Content-Type: application/node.eks.aws
+
+        ---
+        apiVersion: node.eks.aws/v1alpha1
+        kind: NodeConfig
+        spec:
+          cluster:
+            name: ${{ env.EKS_CLUSTER_NAME }}
+            apiServerEndpoint: ${CLUSTER_ENDPOINT}
+            certificateAuthority: ${CLUSTER_CA}
+            cidr: ${CLUSTER_CIDR}
+
+        --BOUNDARY--
+        USERDATA
+
+          USERDATA_B64=$(base64 -w 0 /tmp/userdata.txt)
+
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id $EKS_AMI \
+            --instance-type t3.small \
+            --subnet-id $SUBNET_PUB1 \
+            --security-group-ids $NODE_SG \
+            --iam-instance-profile Name=AmazonEKSNodeInstanceProfile \
+            --user-data "$USERDATA_B64" \
+            --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=eks-${{ env.EKS_CLUSTER_NAME }}-node},{Key=kubernetes.io/cluster/${{ env.EKS_CLUSTER_NAME }},Value=owned}]" \
+            --query 'Instances[0].InstanceId' --output text)
+          echo "✅ Node launched: $INSTANCE_ID"
+
+          echo "⏳ Waiting for node to be running..."
+          aws ec2 wait instance-running --instance-ids $INSTANCE_ID
+          echo "✅ Node is running"
+        fi
+
+        # 7. Create access entry for the node role
+        echo "🔐 Configuring node access to cluster..."
+        aws eks create-access-entry \
+          --cluster-name ${{ env.EKS_CLUSTER_NAME }} \
+          --principal-arn "$EKS_NODE_ROLE_ARN" \
+          --type EC2_LINUX 2>/dev/null || echo "Access entry may already exist"
+
+        # Also add via aws-auth ConfigMap (fallback for older auth modes)
+        cat > /tmp/aws-auth-patch.yaml <<AUTHEOF
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: aws-auth
+          namespace: kube-system
+        data:
+          mapRoles: |
+            - rolearn: ${EKS_NODE_ROLE_ARN}
+              username: system:node:{{EC2PrivateDNSName}}
+              groups:
+                - system:bootstrappers
+                - system:nodes
+        AUTHEOF
+        kubectl apply -f /tmp/aws-auth-patch.yaml 2>/dev/null || true
+
+        echo "⏳ Waiting for node to join cluster (up to 5 min)..."
+        for i in $(seq 1 30); do
+          NODE_COUNT=$(kubectl get nodes --no-headers 2>/dev/null | wc -l)
+          if [ "$NODE_COUNT" -ge 1 ]; then
+            echo "✅ Node joined the cluster!"
+            kubectl get nodes
+            break
+          fi
+          echo "  Waiting... ($i/30)"
+          sleep 10
+        done
+
+        if [ "$NODE_COUNT" -lt 1 ]; then
+          echo "⚠️ Node hasn't joined yet. Check EC2 instance logs."
+          echo "Continuing anyway - node may join later."
+        fi
+
+        # 8. Configure ECR access
+        echo "🔗 Configuring ECR access..."
+        ECR_PASSWORD=$(aws ecr get-login-password --region ${{ env.AWS_REGION }})
+        ECR_SERVER="${AWS_ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+        kubectl create secret docker-registry registry-secret \
+          --namespace=default \
+          --docker-server=$ECR_SERVER \
+          --docker-username=AWS \
+          --docker-password=$ECR_PASSWORD \
+          --docker-email=noreply@example.com \
+          --dry-run=client -o yaml | kubectl apply -f -
+        echo "✅ ECR access configured"
+
+        # 9. Install Traefik Ingress Controller
+        echo "🌐 Installing Traefik Ingress Controller..."
+        curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+        helm repo add traefik https://traefik.github.io/charts
+        helm repo update
+        helm upgrade --install traefik traefik/traefik \
+          --namespace traefik \
+          --create-namespace \
+          --set service.type=LoadBalancer \
+          --set service.annotations."service\.beta\.kubernetes\.io/aws-load-balancer-scheme"=internet-facing \
+          --set service.annotations."service\.beta\.kubernetes\.io/aws-load-balancer-type"=nlb
+        echo "⏳ Waiting for Traefik..."
+        kubectl wait --namespace traefik \
+          --for=condition=ready pod \
+          --selector=app.kubernetes.io/name=traefik \
+          --timeout=300s
+
+        echo ""
+        echo "=== AWS INFRASTRUCTURE CREATED SUCCESSFULLY ==="
+
+    - name: Verify AWS Infrastructure
+      run: |
+        echo "🔍 === VERIFYING AWS INFRASTRUCTURE ==="
+        echo ""
+        echo "🐳 ECR Repository:"
+        aws ecr describe-repositories --repository-names ${{ env.ECR_REPOSITORY_NAME }} --output table
+        echo ""
+        echo "☸️ EKS Cluster:"
+        aws eks describe-cluster --name ${{ env.EKS_CLUSTER_NAME }} --query "cluster.{Name:name, Status:status, Version:version}" --output table
+        echo ""
+        echo "🔗 Kubernetes nodes:"
+        kubectl get nodes
+        echo ""
+        echo "🌐 Traefik Ingress Controller:"
+        kubectl get pods -n traefik -l app.kubernetes.io/name=traefik
+        echo ""
+        echo "🔗 Ingress Controller Service:"
+        kubectl get service -n traefik traefik
+        echo ""
+        echo "✅ All AWS components verified!"
+
+    - name: Generate AWS Summary
+      run: |
+        AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+        ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_NAME }}"
+
+        # Get Traefik LoadBalancer hostname/IP
+        TRAEFIK_HOST=""
+        for i in $(seq 1 30); do
+          TRAEFIK_HOST=$(kubectl get service -n traefik traefik -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+          if [ -z "$TRAEFIK_HOST" ]; then
+            TRAEFIK_HOST=$(kubectl get service -n traefik traefik -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)
+          fi
+          if [ -n "$TRAEFIK_HOST" ]; then break; fi
+          echo "Waiting for Traefik LoadBalancer... ($i/30)"
+          sleep 10
+        done
+        if [ -z "$TRAEFIK_HOST" ]; then
+          TRAEFIK_HOST="(pending - may take a few more minutes)"
+        fi
+
+        # Verify public reachability from GitHub runner
+        INTERNET_STATUS="NOT_CHECKED"
+        INTERNET_DETAILS="LoadBalancer hostname/IP pending"
+        if [[ "$TRAEFIK_HOST" != \(* ]]; then
+          for i in $(seq 1 20); do
+            HTTP_CODE=$(curl -sS -o /dev/null -w "%{http_code}" "http://$TRAEFIK_HOST/" || echo "000")
+            if [ "$HTTP_CODE" != "000" ]; then
+              INTERNET_STATUS="PASS"
+              INTERNET_DETAILS="HTTP $HTTP_CODE from http://$TRAEFIK_HOST/"
+              break
+            fi
+            sleep 5
+          done
+        fi
+        if [ "$INTERNET_STATUS" != "PASS" ] && [[ "$TRAEFIK_HOST" != \(* ]]; then
+          INTERNET_STATUS="FAIL"
+          INTERNET_DETAILS="No HTTP response from http://$TRAEFIK_HOST/"
+        fi
+
+        # Get cluster info
+        EKS_VERSION=$(aws eks describe-cluster --name ${{ env.EKS_CLUSTER_NAME }} --query "cluster.version" --output text)
+        EKS_ENDPOINT=$(aws eks describe-cluster --name ${{ env.EKS_CLUSTER_NAME }} --query "cluster.endpoint" --output text)
+        NODE_INFO=$(kubectl get nodes -o wide --no-headers 2>/dev/null || echo "No nodes found")
+        TRAEFIK_SVC=$(kubectl get service -n traefik traefik --no-headers 2>/dev/null || echo "Not found")
+
+        echo "## 🎉 AWS Infrastructure Created" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 📋 Resources:" >> $GITHUB_STEP_SUMMARY
+        echo "| Resource | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Cloud Provider | AWS |" >> $GITHUB_STEP_SUMMARY
+        echo "| EKS Cluster | \`${{ env.EKS_CLUSTER_NAME }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| Kubernetes Version | \`$EKS_VERSION\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| ECR Repository | \`$ECR_URI\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| Region | ${{ env.AWS_REGION }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| API Endpoint | \`$EKS_ENDPOINT\` |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🌐 Traefik Ingress (LoadBalancer):" >> $GITHUB_STEP_SUMMARY
+        echo "- **External Host**: \`$TRAEFIK_HOST\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Internet Reachability**: **$INTERNET_STATUS**" >> $GITHUB_STEP_SUMMARY
+        echo "- **Check Detail**: $INTERNET_DETAILS" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        echo "$TRAEFIK_SVC" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🖥️ Nodes:" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        echo "$NODE_INFO" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🧪 Test your cluster:" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+        echo "# App Python" >> $GITHUB_STEP_SUMMARY
+        echo "curl http://$TRAEFIK_HOST/" >> $GITHUB_STEP_SUMMARY
+        echo "# App Go" >> $GITHUB_STEP_SUMMARY
+        echo "curl http://$TRAEFIK_HOST/go/" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🔧 Next Steps:" >> $GITHUB_STEP_SUMMARY
+        echo "1. Set variable \`CLOUD_PROVIDER\` = \`aws\`" >> $GITHUB_STEP_SUMMARY
+        echo "2. Push code to main to trigger deployment" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 💡 Local access (optional):" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+        echo "aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}" >> $GITHUB_STEP_SUMMARY
+        echo "kubectl get pods" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+  # ============================
+  # AWS - Destroy Infrastructure
+  # ============================
+  aws-destroy:
+    name: AWS - Destroy Infrastructure
+    if: ${{ inputs.cloud_provider == 'aws' && inputs.action == 'destroy' }}
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Destroy AWS Infrastructure
+      timeout-minutes: 20
+      run: |
+        echo "=== DESTROYING AWS INFRASTRUCTURE (Pure CLI) ==="
+        echo ""
+        echo "⚠️ This will delete ALL EKS, EC2, VPC, and ECR resources"
+        echo ""
+
+        # 1. Terminate EC2 worker nodes
+        echo "🗑️ Terminating worker nodes..."
+        NODE_IDS=$(aws ec2 describe-instances \
+          --filters "Name=tag:Name,Values=eks-${{ env.EKS_CLUSTER_NAME }}-node" \
+                    "Name=instance-state-name,Values=running,pending,stopping,stopped" \
+          --query "Reservations[].Instances[].InstanceId" --output text 2>/dev/null)
+        if [ -n "$NODE_IDS" ] && [ "$NODE_IDS" != "None" ]; then
+          aws ec2 terminate-instances --instance-ids $NODE_IDS
+          echo "⏳ Waiting for instances to terminate..."
+          aws ec2 wait instance-terminated --instance-ids $NODE_IDS
+          echo "✅ Nodes terminated"
+        else
+          echo "- No worker nodes found"
+        fi
+
+        # 2. Cleanup leftover CloudFormation stacks from previous eksctl runs
+        echo "🧹 Checking for leftover CloudFormation stacks..."
+        for STACK_SUFFIX in "cluster" "nodegroup-ng-edteam"; do
+          STACK_NAME="eksctl-${{ env.EKS_CLUSTER_NAME }}-${STACK_SUFFIX}"
+          STACK_STATUS=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].StackStatus" --output text 2>/dev/null || echo "NOT_FOUND")
+          if [ "$STACK_STATUS" != "NOT_FOUND" ]; then
+            echo "🗑️ Deleting stack: $STACK_NAME (status: $STACK_STATUS)..."
+            aws cloudformation update-termination-protection \
+              --no-enable-termination-protection \
+              --stack-name "$STACK_NAME" 2>/dev/null || true
+            aws cloudformation delete-stack --stack-name "$STACK_NAME"
+            aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME" 2>/dev/null || true
+            echo "✅ Stack cleaned up: $STACK_NAME"
+          fi
+        done
+
+        # 3. Delete EKS Cluster
+        CLUSTER_STATUS=$(aws eks describe-cluster --name ${{ env.EKS_CLUSTER_NAME }} \
+          --query "cluster.status" --output text 2>/dev/null || echo "NOT_FOUND")
+        if [ "$CLUSTER_STATUS" != "NOT_FOUND" ]; then
+          echo "🗑️ Deleting EKS Cluster: ${{ env.EKS_CLUSTER_NAME }}..."
+          aws eks delete-cluster --name ${{ env.EKS_CLUSTER_NAME }}
+          echo "⏳ Waiting for cluster deletion..."
+          aws eks wait cluster-deleted --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+          echo "✅ EKS cluster deleted"
+        else
+          echo "- EKS Cluster: Not found"
+        fi
+
+        # 4. Delete VPC and networking
+        echo "🗑️ Cleaning up VPC and networking..."
+        VPC_ID=$(aws ec2 describe-vpcs \
+          --filters "Name=tag:Name,Values=eks-${{ env.EKS_CLUSTER_NAME }}-vpc" \
+          --query "Vpcs[0].VpcId" --output text 2>/dev/null)
+
+        if [ "$VPC_ID" != "None" ] && [ -n "$VPC_ID" ]; then
+          # Delete security groups (non-default)
+          for SG_ID in $(aws ec2 describe-security-groups --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query "SecurityGroups[?GroupName!='default'].GroupId" --output text); do
+            echo "  Deleting SG: $SG_ID"
+            aws ec2 delete-security-group --group-id $SG_ID 2>/dev/null || true
+          done
+
+          # Delete subnets
+          for SUBNET_ID in $(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query "Subnets[].SubnetId" --output text); do
+            echo "  Deleting subnet: $SUBNET_ID"
+            aws ec2 delete-subnet --subnet-id $SUBNET_ID 2>/dev/null || true
+          done
+
+          # Detach and delete internet gateways
+          for IGW_ID in $(aws ec2 describe-internet-gateways \
+            --filters "Name=attachment.vpc-id,Values=$VPC_ID" \
+            --query "InternetGateways[].InternetGatewayId" --output text); do
+            echo "  Detaching and deleting IGW: $IGW_ID"
+            aws ec2 detach-internet-gateway --internet-gateway-id $IGW_ID --vpc-id $VPC_ID
+            aws ec2 delete-internet-gateway --internet-gateway-id $IGW_ID
+          done
+
+          # Delete route tables (non-main)
+          for RTB_ID in $(aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query "RouteTables[?Associations[0].Main!=\`true\`].RouteTableId" --output text); do
+            # Disassociate first
+            for ASSOC_ID in $(aws ec2 describe-route-tables --route-table-id $RTB_ID \
+              --query "RouteTables[0].Associations[?!Main].RouteTableAssociationId" --output text); do
+              aws ec2 disassociate-route-table --association-id $ASSOC_ID 2>/dev/null || true
+            done
+            echo "  Deleting route table: $RTB_ID"
+            aws ec2 delete-route-table --route-table-id $RTB_ID 2>/dev/null || true
+          done
+
+          # Delete VPC
+          echo "  Deleting VPC: $VPC_ID"
+          aws ec2 delete-vpc --vpc-id $VPC_ID
+          echo "✅ VPC and networking deleted"
+        else
+          echo "- VPC: Not found"
+        fi
+
+        # 5. Delete ECR Repository
+        if aws ecr describe-repositories --repository-names ${{ env.ECR_REPOSITORY_NAME }} --region ${{ env.AWS_REGION }} > /dev/null 2>&1; then
+          echo "🗑️ Deleting ECR Repository: ${{ env.ECR_REPOSITORY_NAME }}..."
+          aws ecr delete-repository \
+            --repository-name ${{ env.ECR_REPOSITORY_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --force
+          echo "✅ ECR repository deleted"
+        else
+          echo "- ECR Repository: Not found"
+        fi
+
+        # 6. Delete IAM roles and instance profiles
+        echo "🗑️ Cleaning up IAM roles..."
+        # Instance profile first
+        if aws iam get-instance-profile --instance-profile-name AmazonEKSNodeInstanceProfile > /dev/null 2>&1; then
+          aws iam remove-role-from-instance-profile \
+            --instance-profile-name AmazonEKSNodeInstanceProfile \
+            --role-name AmazonEKSNodeRole 2>/dev/null || true
+          aws iam delete-instance-profile --instance-profile-name AmazonEKSNodeInstanceProfile
+          echo "✅ Instance profile deleted"
+        fi
+
+        for ROLE_NAME in AmazonEKSNodeRole eksClusterRole; do
+          if aws iam get-role --role-name $ROLE_NAME > /dev/null 2>&1; then
+            echo "  Cleaning up $ROLE_NAME..."
+            POLICIES=$(aws iam list-attached-role-policies --role-name $ROLE_NAME \
+              --query "AttachedPolicies[].PolicyArn" --output text)
+            for POLICY_ARN in $POLICIES; do
+              aws iam detach-role-policy --role-name $ROLE_NAME --policy-arn $POLICY_ARN
+            done
+            aws iam delete-role --role-name $ROLE_NAME
+            echo "✅ $ROLE_NAME deleted"
+          fi
+        done
+
+        echo ""
+        echo "✅ AWS cleanup completed"
+
+    - name: Generate AWS Cleanup Summary
+      run: |
+        echo "## 🗑️ AWS Infrastructure Cleanup" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "- **Cloud Provider**: AWS" >> $GITHUB_STEP_SUMMARY
+        echo "- **EKS Cluster**: 🗑️ Deleted" >> $GITHUB_STEP_SUMMARY
+        echo "- **ECR Repository**: 🗑️ Deleted" >> $GITHUB_STEP_SUMMARY
